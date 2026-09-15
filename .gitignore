@@ -1,0 +1,66 @@
+# Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environment
+
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / secrets
+
+.env
+.env.*
+!.env.example
+
+# Pyrogram / Telegram sessions
+
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+# IDE / editors
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build / packaging
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+
+*.log
+
+# Temporary files
+
+tmp/
+temp/
+*.tmp
+
