@@ -24,6 +24,7 @@ class BatchItem:
     duration: Optional[int] = None
     supports_streaming: bool = False
     has_spoiler: bool = False
+    caption: Optional[str] = None
 
 
 @dataclass
@@ -78,3 +79,24 @@ class UserState:
     pending_valid_items: list[BatchItem] = field(default_factory=list)
     pending_rejected_items: list[BatchItem] = field(default_factory=list)
     pending_review_message_id: Optional[int] = None
+
+    # Text of the last "✅ Batch finished" summary, so a rejected
+    # incoming burst (season-change "No") can restore this screen
+    # instead of showing a generic cancellation message.
+    last_finished_text: Optional[str] = None
+
+    # ---------------------------------------------------------
+    # Cover-only mode
+    # ---------------------------------------------------------
+    #
+    # Active when a cover is saved but no /scaption sequence is
+    # running: media is just re-sent with the cover applied
+    # (videos) or passed through untouched (everything else),
+    # original captions preserved, no caption rewriting.
+    #
+    cover_batch: list[BatchItem] = field(default_factory=list)
+    cover_preview_message_id: Optional[int] = None
+    cover_collection_task: Optional[asyncio.Task] = field(
+        default=None,
+        repr=False,
+    )

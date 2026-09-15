@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from pyrogram import Client
-from pyrogram.types import CallbackQuery
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
-from ..cover import send_video_with_cover
+from ..cover import CoverSendError, send_video_with_cover
 from ..preview import (
     batch_keyboard,
     build_preview,
@@ -81,6 +86,59 @@ async def _delete_message(
         pass
 
 
+async def _delete_items_messages(
+    client: Client,
+    items,
+) -> tuple[int, int]:
+    """
+    Delete the source messages for a list of BatchItems, grouped by
+    chat so each chat only needs one delete_messages call.
+
+    Returns (deleted_count, failed_count).
+    """
+    by_chat: dict[int, list[int]] = {}
+
+    for item in items:
+        by_chat.setdefault(
+            item.chat_id, []
+        ).append(item.message_id)
+
+    deleted = 0
+    failed = 0
+
+    for chat_id, message_ids in by_chat.items():
+        try:
+            await client.delete_messages(
+                chat_id,
+                message_ids,
+            )
+            deleted += len(message_ids)
+        except Exception as error:
+            print(
+                f"Could not delete rejected batch "
+                f"messages in {chat_id}: {error}"
+            )
+            failed += len(message_ids)
+
+    return deleted, failed
+
+
+def _restore_finished_screen(state) -> tuple[str, object]:
+    """
+    Text + keyboard to fall back to after handling a rejected
+    incoming burst: the last completed batch summary if one
+    exists, otherwise a generic cancellation notice.
+    """
+    if state.last_finished_text:
+        return state.last_finished_text, finished_keyboard()
+
+    return (
+        "❌ Incoming batch cancelled.\n\n"
+        "No source files were processed or deleted.",
+        None,
+    )
+
+
 async def _delete_ack_messages(
     client: Client,
     state,
@@ -140,6 +198,14 @@ def _is_review_callback(
     data: str,
 ) -> bool:
     return data in {
+        # Actual buttons sent by media.py / commands.py.
+        "seq_batch_yes",
+        "seq_batch_no",
+        # Follow-up "delete these source messages?" confirmation
+        # shown after "seq_batch_no".
+        "seq_batch_no_delete_yes",
+        "seq_batch_no_delete_no",
+        # Legacy / alternate aliases kept for compatibility.
         "review_yes",
         "review_no",
         "yes",
@@ -168,6 +234,15 @@ def _is_preview_callback(
         or data.startswith("up:")
         or data.startswith("down:")
     )
+
+
+def _is_cover_batch_callback(
+    data: str,
+) -> bool:
+    return data in {
+        "cover_confirm",
+        "cover_cancel",
+    }
 
 
 def _preview_result(
@@ -273,6 +348,17 @@ def _validate_stateful_callback(
             state.preview_message_id is not None
             and message_id
             == state.preview_message_id
+        )
+
+    # ---------------------------------------------------------------
+    # Cover-only batch (no caption sequence active)
+    # ---------------------------------------------------------------
+
+    if _is_cover_batch_callback(data):
+        return (
+            state.cover_preview_message_id is not None
+            and message_id
+            == state.cover_preview_message_id
         )
 
     # ---------------------------------------------------------------
@@ -438,55 +524,46 @@ async def _process_batch(
             # -----------------------------------------------------------
 
             try:
-                copied = False
-
                 # -------------------------------------------------------
                 # Video cover
+                #
+                # send_video_with_cover() is a synchronous, keyword-only
+                # function (it talks to the Bot API directly via
+                # urllib), so it must not be awaited directly and must
+                # be called with the real chat/file fields pulled off
+                # the item.  Per the documented contract, a rejected
+                # cover operation counts this item as FAILED — it must
+                # NOT silently fall back to a cover-less copy, or the
+                # user would never learn the cover wasn't applied.
                 # -------------------------------------------------------
 
                 if (
                     state.cover_file_id
                     and item.media_type == "video"
                 ):
-                    try:
-                        await send_video_with_cover(
-                            client=client,
-                            item=item,
-                            caption=caption,
-                            cover_file_id=state.cover_file_id,
+                    if not item.file_id:
+                        raise CoverSendError(
+                            "Video is missing a file_id."
                         )
 
-                        copied = True
+                    await asyncio.to_thread(
+                        send_video_with_cover,
+                        chat_id=item.chat_id,
+                        video_file_id=item.file_id,
+                        caption=caption,
+                        cover_file_id=state.cover_file_id,
+                        width=item.width,
+                        height=item.height,
+                        duration=item.duration,
+                        supports_streaming=item.supports_streaming,
+                        has_spoiler=item.has_spoiler,
+                    )
 
-                    except TypeError:
-                        # Compatibility with positional implementation.
-                        try:
-                            await send_video_with_cover(
-                                client,
-                                item,
-                                caption,
-                                state.cover_file_id,
-                            )
-
-                            copied = True
-
-                        except Exception as error:
-                            print(
-                                f"Cover processing failed for "
-                                f"{item.display_name}: {error}"
-                            )
-
-                    except Exception as error:
-                        print(
-                            f"Cover processing failed for "
-                            f"{item.display_name}: {error}"
-                        )
-
-                # -------------------------------------------------------
-                # Normal Telegram copy
-                # -------------------------------------------------------
-
-                if not copied:
+                else:
+                    # -----------------------------------------------
+                    # Normal Telegram copy (no cover requested, or
+                    # non-video media).
+                    # -----------------------------------------------
                     await client.copy_message(
                         chat_id=item.chat_id,
                         from_chat_id=item.chat_id,
@@ -662,10 +739,16 @@ async def _process_batch(
                     f"• ...and {len(failed_items) - 20} more"
                 )
 
+        finished_text = "\n".join(result_lines)
+
+        # Remembered so a later rejected incoming burst ("No") can
+        # restore this screen instead of a generic cancel message.
+        state.last_finished_text = finished_text
+
         try:
             await client.send_message(
                 chat_id=query.from_user.id,
-                text="\n".join(result_lines),
+                text=finished_text,
                 reply_markup=finished_keyboard(),
             )
 
@@ -681,6 +764,155 @@ async def _process_batch(
 
         state.processing = False
 
+        await _answer(
+            query,
+            "An unexpected error occurred. "
+            "Your source files were not intentionally deleted.",
+            show_alert=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cover-only processing (no caption sequence active)
+# ---------------------------------------------------------------------------
+
+
+async def _process_cover_batch(
+    client: Client,
+    query: CallbackQuery,
+    state,
+) -> None:
+    """
+    Apply the saved cover to videos and pass everything else
+    through untouched — original captions are always preserved,
+    nothing rewrites SxxExx here.
+    """
+
+    if state.processing:
+        await _answer(
+            query,
+            "⏳ This batch is already processing.",
+        )
+        return
+
+    if not state.cover_batch:
+        await _answer(
+            query,
+            "Batch is empty.",
+            show_alert=True,
+        )
+        return
+
+    state.processing = True
+    items = list(state.cover_batch)
+
+    await _edit(
+        query,
+        "⏳ Applying cover...\n\n"
+        "Please wait until all files are finished.",
+    )
+    await _answer(query, "Processing...")
+
+    processed_items = []
+    failed_items = []
+
+    try:
+        for item in items:
+            try:
+                if item.media_type == "video":
+                    if not item.file_id:
+                        raise CoverSendError(
+                            "Video is missing a file_id."
+                        )
+
+                    await asyncio.to_thread(
+                        send_video_with_cover,
+                        chat_id=item.chat_id,
+                        video_file_id=item.file_id,
+                        caption=item.caption or "",
+                        cover_file_id=state.cover_file_id,
+                        width=item.width,
+                        height=item.height,
+                        duration=item.duration,
+                        supports_streaming=item.supports_streaming,
+                        has_spoiler=item.has_spoiler,
+                    )
+                else:
+                    # caption omitted -> pyrogram keeps the original.
+                    await client.copy_message(
+                        chat_id=item.chat_id,
+                        from_chat_id=item.chat_id,
+                        message_id=item.message_id,
+                    )
+
+                processed_items.append(item)
+
+            except Exception as error:
+                failed_items.append((item, str(error)))
+                print(
+                    f"Cover-only processing failed for "
+                    f"{item.display_name}: {error}"
+                )
+
+        deleted = 0
+        delete_failed = 0
+
+        for item in processed_items:
+            try:
+                await client.delete_messages(
+                    chat_id=item.chat_id,
+                    message_ids=item.message_id,
+                )
+                deleted += 1
+            except Exception as error:
+                delete_failed += 1
+                print(
+                    f"Could not delete source "
+                    f"{item.display_name}: {error}"
+                )
+
+        state.cover_batch.clear()
+        state.cover_preview_message_id = None
+        state.processing = False
+
+        result_lines = [
+            "✅ Cover batch finished.",
+            "",
+            f"Total: {len(items)}",
+            f"Processed: {len(processed_items)}",
+            f"Failed: {len(failed_items)}",
+            f"Sources deleted: {deleted}",
+        ]
+
+        if delete_failed:
+            result_lines.append(
+                f"Source deletion failed: {delete_failed}"
+            )
+
+        if failed_items:
+            result_lines.extend(["", "❌ Failed files:"])
+            for item, _ in failed_items[:20]:
+                result_lines.append(f"• {item.display_name}")
+            if len(failed_items) > 20:
+                result_lines.append(
+                    f"• ...and {len(failed_items) - 20} more"
+                )
+
+        try:
+            await client.send_message(
+                chat_id=query.from_user.id,
+                text="\n".join(result_lines),
+            )
+        except Exception as error:
+            print(
+                f"Could not send cover batch result: {error}"
+            )
+
+    except Exception as error:
+        print(
+            f"Unexpected cover batch processing error: {error}"
+        )
+        state.processing = False
         await _answer(
             query,
             "An unexpected error occurred. "
@@ -871,6 +1103,7 @@ async def callback_handler(
     # ===============================================================
 
     if data in {
+        "seq_batch_yes",
         "review_yes",
         "yes",
         "review_confirm",
@@ -946,6 +1179,7 @@ async def callback_handler(
 
         # The review message becomes the active preview message.
         state.preview_message_id = query.message.id
+        state.preview_chat_id = query.message.chat.id
 
         # -----------------------------------------------------------
         # Build the real preview using build_preview(state).
@@ -996,6 +1230,7 @@ async def callback_handler(
     # ===============================================================
 
     if data in {
+        "seq_batch_no",
         "review_no",
         "no",
         "review_cancel",
@@ -1019,20 +1254,34 @@ async def callback_handler(
         )
 
         if has_pending:
-            state.pending_items.clear()
-            state.pending_valid_items.clear()
-            state.pending_rejected_items.clear()
-            state.pending_review_message_id = None
+            # Do NOT clear pending_* yet — the follow-up delete
+            # confirmation still needs the item list.
+            count = len(rejected)
 
             await _answer(
                 query,
-                "Incoming batch cancelled.",
+                "Incoming batch rejected.",
             )
 
             await _edit(
                 query,
-                "❌ Incoming batch cancelled.\n\n"
-                "No source files were processed or deleted.",
+                "❌ Incoming batch rejected.\n\n"
+                f"Delete these {count} source message(s) "
+                "from the chat?",
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🗑️ Yes, delete",
+                                callback_data="seq_batch_no_delete_yes",
+                            ),
+                            InlineKeyboardButton(
+                                "Keep them",
+                                callback_data="seq_batch_no_delete_no",
+                            ),
+                        ]
+                    ]
+                ),
             )
 
             return
@@ -1055,6 +1304,58 @@ async def callback_handler(
             query,
             "❌ Batch cancelled.\n\n"
             "No source files were processed or deleted.",
+        )
+
+        return
+
+    # ===============================================================
+    # REVIEW NO -> DELETE CONFIRMATION
+    #
+    # Follow-up to "seq_batch_no": the user chose whether to delete
+    # the rejected incoming burst's source messages. Either way we
+    # restore the previous "Batch finished" screen if one exists.
+    # ===============================================================
+
+    if data in {
+        "seq_batch_no_delete_yes",
+        "seq_batch_no_delete_no",
+    }:
+        items = list(state.pending_items)
+
+        state.pending_items.clear()
+        state.pending_valid_items.clear()
+        state.pending_rejected_items.clear()
+        state.pending_review_message_id = None
+
+        deleted = 0
+        delete_failed = 0
+
+        if data == "seq_batch_no_delete_yes" and items:
+            deleted, delete_failed = (
+                await _delete_items_messages(
+                    client,
+                    items,
+                )
+            )
+
+        text, keyboard = _restore_finished_screen(state)
+
+        if data == "seq_batch_no_delete_yes":
+            toast = f"Deleted {deleted} source message(s)."
+            if delete_failed:
+                toast += f" {delete_failed} could not be deleted."
+        else:
+            toast = "Kept the source messages."
+
+        await _answer(
+            query,
+            toast,
+        )
+
+        await _edit(
+            query,
+            text,
+            keyboard,
         )
 
         return
@@ -1267,6 +1568,36 @@ async def callback_handler(
         # -----------------------------------------------------------
 
         await _process_batch(
+            client,
+            query,
+            state,
+        )
+
+        return
+
+    # ===============================================================
+    # COVER-ONLY BATCH (no caption sequence active)
+    # ===============================================================
+
+    if data == "cover_cancel":
+        state.cover_batch.clear()
+        state.cover_preview_message_id = None
+
+        await _answer(
+            query,
+            "Cover batch cancelled.",
+        )
+
+        await _edit(
+            query,
+            "❌ Cover batch cancelled.\n\n"
+            "No source files were changed or deleted.",
+        )
+
+        return
+
+    if data == "cover_confirm":
+        await _process_cover_batch(
             client,
             query,
             state,

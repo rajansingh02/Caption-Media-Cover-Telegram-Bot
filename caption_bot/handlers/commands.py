@@ -576,6 +576,17 @@ def register(app):
             except asyncio.CancelledError:
                 pass
 
+        if (
+            state.cover_collection_task
+            and not state.cover_collection_task.done()
+        ):
+            state.cover_collection_task.cancel()
+
+            try:
+                await state.cover_collection_task
+            except asyncio.CancelledError:
+                pass
+
         # IMPORTANT:
         # /stop cancels the workflow but DOES NOT delete source
         # media. Source deletion is reserved for successful

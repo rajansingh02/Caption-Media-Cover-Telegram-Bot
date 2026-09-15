@@ -126,6 +126,7 @@ def build_batch_item(message) -> BatchItem:
         chat_id=message.chat.id,
         filename=filename,
         display_name=get_display_name(message),
+        caption=message.caption,
         detected=detect_episode(filename),
         media_type=media_type,
         file_id=file_id,
@@ -752,6 +753,176 @@ async def _finalize_incoming(
     )
 
 
+def _cover_only_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Confirm & apply cover",
+                    callback_data="cover_confirm",
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="cover_cancel",
+                ),
+            ]
+        ]
+    )
+
+
+def _build_cover_preview_text(
+    state,
+    items: list[BatchItem],
+) -> str:
+    videos = sum(
+        1
+        for item in items
+        if item.media_type == "video"
+    )
+
+    lines = [
+        "🖼️ Cover-only mode "
+        "(no caption sequence active).",
+        "",
+        f"📦 Batch: {len(items)} file(s), "
+        f"{videos} video(s) will get the "
+        "saved cover.",
+        "Other files are passed through "
+        "unchanged.",
+        "",
+    ]
+
+    for index, item in enumerate(items, 1):
+        lines.append(
+            f"{index}. "
+            f"{_short_name(item.display_name, 100)}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Confirm to process?",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+async def _finalize_cover_only(
+    client,
+    user_id: int,
+):
+    """Wait for the incoming burst to become quiet, then show a
+    cover-only confirmation for the whole burst."""
+
+    try:
+        await asyncio.sleep(
+            COLLECTION_DELAY
+        )
+    except asyncio.CancelledError:
+        return
+
+    state = get_state(user_id)
+
+    if (
+        state.cover_collection_task
+        is not asyncio.current_task()
+    ):
+        return
+
+    state.cover_collection_task = None
+
+    if not state.cover_batch:
+        return
+
+    # A caption sequence or normal preview started meanwhile —
+    # let that flow take over instead.
+    if (
+        state.current_caption
+        or state.processing
+        or state.cover_preview_message_id
+    ):
+        return
+
+    items = list(state.cover_batch)
+
+    # Sort into a sensible sequence when every file carries a
+    # detectable SxxExx marker; otherwise keep arrival order.
+    if items and all(item.detected for item in items):
+        items.sort(
+            key=lambda item: (
+                item.detected.season,
+                item.detected.episode,
+            )
+        )
+
+    state.cover_batch = items
+
+    review = await client.send_message(
+        user_id,
+        _build_cover_preview_text(
+            state,
+            items,
+        ),
+        reply_markup=_cover_only_keyboard(),
+    )
+
+    state.cover_preview_message_id = review.id
+
+
+async def _receive_cover_only(
+    client,
+    message,
+    state,
+    user_id: int,
+):
+    """Collect media for cover-only mode (no /scaption active)."""
+
+    if state.processing:
+        await message.reply_text(
+            "⏳ The current batch is still "
+            "processing."
+        )
+        return
+
+    if state.cover_preview_message_id:
+        await message.reply_text(
+            "⚠️ A cover batch is waiting for "
+            "confirmation.\n\n"
+            "Confirm or cancel it first."
+        )
+        return
+
+    if (
+        len(state.cover_batch)
+        >= MAX_BATCH_SIZE
+    ):
+        await message.reply_text(
+            f"⚠️ Batch limit reached "
+            f"({MAX_BATCH_SIZE})."
+        )
+        return
+
+    state.cover_batch.append(
+        build_batch_item(message)
+    )
+
+    if (
+        state.cover_collection_task
+        and not state.cover_collection_task.done()
+    ):
+        state.cover_collection_task.cancel()
+
+    state.cover_collection_task = (
+        asyncio.create_task(
+            _finalize_cover_only(
+                client,
+                user_id,
+            )
+        )
+    )
+
+
 def register(app):
     @app.on_message(MEDIA_FILTER)
     async def receive(client, message):
@@ -793,9 +964,20 @@ def register(app):
 
         # -----------------------------------------------------
         # No active caption sequence
+        #
+        # If a cover is saved, run in cover-only mode instead of
+        # dropping the media: just re-send with the cover applied,
+        # no caption rewriting, no /scaption required.
         # -----------------------------------------------------
 
         if not state.current_caption:
+            if state.cover_file_id:
+                await _receive_cover_only(
+                    client,
+                    message,
+                    state,
+                    user_id,
+                )
             return
 
         # -----------------------------------------------------
