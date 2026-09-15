@@ -12,6 +12,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
 )
 
+from .. import archive
 from ..cover import CoverSendError, send_video_with_cover
 from ..preview import (
     batch_keyboard,
@@ -26,6 +27,7 @@ from ..sequence import (
     next_season_episode,
 )
 from ..state import get_state
+from . import transfer
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +576,45 @@ async def _process_batch(
                 processed_items.append(item)
                 successful_eps.append(episode)
 
+                # -------------------------------------------------------
+                # Archive for /transfer.
+                #
+                # This is the only place completed episodes get recorded.
+                # It must never fail the batch itself — /transfer simply
+                # won't see this episode if writing the archive fails.
+                # -------------------------------------------------------
+
+                try:
+                    cover_used = (
+                        state.cover_file_id
+                        if (
+                            state.cover_file_id
+                            and item.media_type == "video"
+                        )
+                        else None
+                    )
+
+                    archive.record_episode(
+                        owner_id=query.from_user.id,
+                        season=episode.season,
+                        episode=episode.episode,
+                        caption=caption,
+                        media_type=item.media_type,
+                        file_id=item.file_id,
+                        width=item.width,
+                        height=item.height,
+                        duration=item.duration,
+                        supports_streaming=item.supports_streaming,
+                        has_spoiler=item.has_spoiler,
+                        cover_file_id=cover_used,
+                    )
+
+                except Exception as error:
+                    print(
+                        "Could not archive episode for /transfer: "
+                        f"{error}"
+                    )
+
             except Exception as error:
                 failed_items.append(
                     (
@@ -980,6 +1021,19 @@ async def callback_handler(
 
     user_id = _state_user_id(query)
     state = get_state(user_id)
+
+    # ---------------------------------------------------------------
+    # /transfer picker (season toggle / done / cancel)
+    # ---------------------------------------------------------------
+
+    if data.startswith("xfer_"):
+        await transfer.handle_callback(
+            client,
+            query,
+            data,
+            state,
+        )
+        return
 
     # ---------------------------------------------------------------
     # NEXT SEASON

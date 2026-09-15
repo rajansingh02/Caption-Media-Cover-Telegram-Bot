@@ -100,3 +100,13 @@ class UserState:
         default=None,
         repr=False,
     )
+
+    # ---------------------------------------------------------
+    # /transfer season picker
+    # ---------------------------------------------------------
+    #
+    # Seasons currently toggled on in the /transfer inline picker.
+    # Cleared once a link is generated or the picker is cancelled.
+    #
+    transfer_selection: set[int] = field(default_factory=set)
+    transfer_message_id: Optional[int] = None

@@ -8,7 +8,7 @@ except RuntimeError:
 from pyrogram import Client
 
 from .config import API_HASH, API_ID, BOT_TOKEN, SESSION_NAME
-from .handlers import callbacks, commands, media
+from .handlers import callbacks, commands, media, transfer
 
 app = Client(
     SESSION_NAME,
@@ -19,6 +19,7 @@ app = Client(
 
 commands.register(app)
 media.register(app)
+transfer.register(app)
 callbacks.register(app)
 
 if __name__ == "__main__":
