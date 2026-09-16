@@ -1,3 +1,8 @@
 Pyrogram==2.0.106
 TgCrypto>=1.2.5
 python-dotenv>=1.0.1
+
+# Optional, picked up automatically when installed. Gives a faster event
+# loop with lower per-task overhead; skip it if the device has no compiler
+# and no wheel is available.
+# uvloop>=0.19.0

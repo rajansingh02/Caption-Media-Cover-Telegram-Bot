@@ -1,9 +1,32 @@
-"""Smart season/episode detection and sequence planning."""
+"""Smart season/episode detection and sequence planning.
+
+Performance notes
+-----------------
+
+`detect_episode()` is the single hottest function in the bot: it runs for
+every incoming file, again for every re-analysis of a burst, again for
+every preview rebuild (each ⬆️/⬇️ press) and again for every item during
+processing. Two changes keep that cheap:
+
+1. Marker pairing is O(S + E) instead of O(S × E) with a sort. The old
+   version built one tuple per (season, episode) combination and sorted
+   the whole list; matches arrive in positional order, so a single
+   two-pointer pass finds the same winner.
+
+2. Results are memoised per string. Filenames and captions repeat
+   constantly within a batch, so the regex scan usually runs once per
+   distinct name instead of once per lookup.
+
+Detection and replacement semantics are unchanged, with one fix: a marker
+written with three or more digits (S001) now keeps its width, which is
+what the docstring below and tests/test_sequence.py always expected.
+"""
 
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from functools import lru_cache
+from typing import Optional
 
 from .models import BatchItem, Episode
 
@@ -12,37 +35,74 @@ from .models import BatchItem, Episode
 # Independent Sxx / Exx markers
 # ---------------------------------------------------------
 
+#
+# The leading zeros are captured as their own group purely so the written
+# width can be measured with two len() calls instead of a Python-level
+# scan over the match. The matching behaviour is identical to the
+# original `S\s*0*(\d{1,3})(?!\d)` form.
+#
 SEASON_RE = re.compile(
-    r"(?<![A-Za-z])S\s*0*(\d{1,3})(?!\d)",
+    r"(?<![A-Za-z])S\s*(0*)(\d{1,3})(?!\d)",
     re.IGNORECASE,
 )
 
 EPISODE_RE = re.compile(
-    r"(?<![A-Za-z])E\s*0*(\d{1,4})(?!\d)",
+    r"(?<![A-Za-z])E\s*(0*)(\d{1,4})(?!\d)",
     re.IGNORECASE,
 )
 
-
-def _find_markers(text: str | None):
-    if not text:
-        return [], []
-
-    seasons = [
-        match
-        for match in SEASON_RE.finditer(text)
-        if int(match.group(1)) >= 1
-    ]
-
-    episodes = [
-        match
-        for match in EPISODE_RE.finditer(text)
-        if int(match.group(1)) >= 1
-    ]
-
-    return seasons, episodes
+# Memoisation budget. Each entry is a couple of small tuples, so even a
+# full cache costs well under 100 KB.
+_CACHE_SIZE = 512
 
 
-def _best_marker_pair(text: str | None):
+# One Sxx or Exx marker found in a string, as a plain tuple:
+#
+#     (start, end, value, width)
+#
+# A NamedTuple reads better but costs ~20% more to build, and two of
+# these are constructed for every filename the bot looks at, so the
+# layout is documented here and unpacked at each use instead.
+_START = 0
+_END = 1
+_VALUE = 2
+_WIDTH = 3
+
+Marker = tuple[int, int, int, int]
+
+
+def _markers(pattern: re.Pattern[str], text: str) -> list[Marker]:
+    found: list[Marker] = []
+
+    for match in pattern.finditer(text):
+        zeros, digits = match.group(1, 2)
+
+        value = int(digits)
+
+        if value < 1:
+            continue
+
+        # Width is the digit count as written, so S001 stays three wide
+        # and S01/S1 stay two wide. Both halves come straight from the
+        # regex, so no Python-level scan of the match is needed.
+        width = len(zeros) + len(digits)
+
+        found.append(
+            (
+                match.start(),
+                match.end(),
+                value,
+                width if width > 2 else 2,
+            )
+        )
+
+    return found
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def _best_marker_pair_cached(
+    text: str,
+) -> Optional[tuple[Marker, Marker]]:
     """
     Find the most sensible Sxx + Exx pair.
 
@@ -50,40 +110,70 @@ def _best_marker_pair(text: str | None):
     to appear in S-before-E order.
 
     If several markers exist, choose the pair with the smallest
-    distance between them.
+    distance between them; ties prefer the earliest Sxx, then the
+    earliest Exx.
     """
-    seasons, episodes = _find_markers(text)
+    seasons = _markers(SEASON_RE, text)
 
-    if not seasons or not episodes:
+    if not seasons:
         return None
 
-    candidates = []
+    episodes = _markers(EPISODE_RE, text)
 
-    for season_match in seasons:
-        for episode_match in episodes:
-            distance = abs(
-                season_match.start() - episode_match.start()
+    if not episodes:
+        return None
+
+    # Overwhelmingly the common case: one Sxx and one Exx in the name.
+    if len(seasons) == 1 and len(episodes) == 1:
+        return seasons[0], episodes[0]
+
+    # Matches come out of finditer in increasing start order, so the
+    # closest episode to each season is always one of the two straddling
+    # it. Walking both lists once therefore finds the global winner.
+    best: Optional[tuple[int, int, int]] = None
+    best_pair: Optional[tuple[Marker, Marker]] = None
+
+    index = 0
+    total = len(episodes)
+
+    for season in seasons:
+        season_start = season[_START]
+
+        while (
+            index < total
+            and episodes[index][_START] < season_start
+        ):
+            index += 1
+
+        for candidate in (
+            episodes[index - 1] if index else None,
+            episodes[index] if index < total else None,
+        ):
+            if candidate is None:
+                continue
+
+            candidate_start = candidate[_START]
+
+            key = (
+                abs(season_start - candidate_start),
+                season_start,
+                candidate_start,
             )
 
-            candidates.append(
-                (
-                    distance,
-                    season_match.start(),
-                    episode_match.start(),
-                    season_match,
-                    episode_match,
-                )
-            )
+            if best is None or key < best:
+                best = key
+                best_pair = (season, candidate)
 
-    candidates.sort(
-        key=lambda value: (
-            value[0],
-            value[1],
-            value[2],
-        )
-    )
+    return best_pair
 
-    return candidates[0][3], candidates[0][4]
+
+def _best_marker_pair(
+    text: str | None,
+) -> Optional[tuple[Marker, Marker]]:
+    if not text:
+        return None
+
+    return _best_marker_pair_cached(text)
 
 
 def detect_episode(text: str | None) -> Episode | None:
@@ -92,26 +182,9 @@ def detect_episode(text: str | None) -> Episode | None:
     if pair is None:
         return None
 
-    season_match, episode_match = pair
+    season, episode = pair
 
-    season = int(season_match.group(1))
-    episode = int(episode_match.group(1))
-
-    if season < 1 or episode < 1:
-        return None
-
-    return Episode(season, episode)
-
-
-def _marker_width(match) -> int:
-    """
-    Preserve at least two digits.
-
-    S01 -> width 2
-    S001 -> width 3
-    S1 -> width 2
-    """
-    return max(2, len(match.group(1)))
+    return Episode(season[_VALUE], episode[_VALUE])
 
 
 def replace_episode(text: str, episode: Episode) -> str:
@@ -141,47 +214,29 @@ def replace_episode(text: str, episode: Episode) -> str:
             "No Sxx/Exx markers found in caption"
         )
 
-    season_match, episode_match = pair
+    season_marker, episode_marker = pair
 
-    season_width = _marker_width(season_match)
-    episode_width = _marker_width(episode_match)
+    season_token = f"S{episode.season:0{season_marker[_WIDTH]}d}"
+    episode_token = f"E{episode.episode:0{episode_marker[_WIDTH]}d}"
 
-    season_token = (
-        f"S{episode.season:0{season_width}d}"
-    )
+    # Apply the markers in positional order so both spans stay valid,
+    # and build the result with one join instead of repeated slicing.
+    if season_marker[_START] <= episode_marker[_START]:
+        first, first_token = season_marker, season_token
+        second, second_token = episode_marker, episode_token
+    else:
+        first, first_token = episode_marker, episode_token
+        second, second_token = season_marker, season_token
 
-    episode_token = (
-        f"E{episode.episode:0{episode_width}d}"
-    )
-
-    replacements = [
+    return "".join(
         (
-            season_match.start(),
-            season_match.end(),
-            season_token,
-        ),
-        (
-            episode_match.start(),
-            episode_match.end(),
-            episode_token,
-        ),
-    ]
-
-    # Replace from right to left so the original match
-    # positions remain valid.
-    result = text
-
-    for start, end, replacement in sorted(
-        replacements,
-        reverse=True,
-    ):
-        result = (
-            result[:start]
-            + replacement
-            + result[end:]
+            text[: first[_START]],
+            first_token,
+            text[first[_END] : second[_START]],
+            second_token,
+            text[second[_END] :],
         )
-
-    return result
+    )
 
 
 def increment(episode: Episode) -> Episode:
@@ -196,6 +251,11 @@ def next_season_episode(episode: Episode) -> Episode:
         episode.season + 1,
         1,
     )
+
+
+def _episode_sort_key(item: BatchItem) -> tuple[int, int]:
+    detected = item.detected
+    return (detected.season, detected.episode)
 
 
 def plan_batch(
@@ -222,17 +282,22 @@ def plan_batch(
     if not items:
         return [], []
 
+    # One pass to split explicit from unmarked instead of three
+    # separate comprehensions over the batch.
+    explicit: list[BatchItem] = []
+    unmarked: list[BatchItem] = []
+
+    for item in items:
+        if item.detected is not None:
+            explicit.append(item)
+        else:
+            unmarked.append(item)
+
     # ---------------------------------------------------------
     # Every item has an explicit episode.
     # ---------------------------------------------------------
-    if all(item.detected for item in items):
-        ordered = sorted(
-            items,
-            key=lambda item: (
-                item.detected.season,
-                item.detected.episode,
-            ),
-        )
+    if not unmarked:
+        ordered = sorted(explicit, key=_episode_sort_key)
 
         assignments: list[Episode] = []
 
@@ -248,44 +313,23 @@ def plan_batch(
 
         return ordered, assignments  # type: ignore[arg-type]
 
-    explicit = [
-        item
-        for item in items
-        if item.detected
-    ]
-
     # ---------------------------------------------------------
     # Mixed explicit + unmarked files
     # ---------------------------------------------------------
     if explicit:
-        anchors = sorted(
-            explicit,
-            key=lambda item: (
-                item.detected.season,
-                item.detected.episode,
-            ),
-        )
-
-        unmarked = [
-            item
-            for item in items
-            if not item.detected
-        ]
+        anchors = sorted(explicit, key=_episode_sort_key)
 
         # A newer explicit season/episode becomes the effective
         # starting point instead of blindly continuing the old
         # caption sequence.
-        newer = [
-            item.detected
-            for item in anchors
-            if item.detected and item.detected > current
-        ]
+        effective_start = current
 
-        effective_start = (
-            min(newer)
-            if newer
-            else current
-        )
+        for item in anchors:
+            detected = item.detected
+
+            if detected is not None and detected > current:
+                effective_start = detected
+                break
 
         first_anchor = anchors[0].detected
 
@@ -293,10 +337,8 @@ def plan_batch(
         after: list[BatchItem] = []
 
         if (
-            first_anchor.season
-            == effective_start.season
-            and first_anchor.episode
-            > effective_start.episode
+            first_anchor.season == effective_start.season
+            and first_anchor.episode > effective_start.episode
         ):
             capacity = (
                 first_anchor.episode
@@ -310,7 +352,7 @@ def plan_batch(
             after = unmarked
 
         result: list[BatchItem] = []
-        assignments: list[Episode] = []
+        assignments = []
 
         # -----------------------------------------------------
         # Fill before first explicit anchor.
@@ -322,9 +364,7 @@ def plan_batch(
             )
 
             if start_episode < 1:
-                start_episode = (
-                    effective_start.episode
-                )
+                start_episode = effective_start.episode
 
             for offset, item in enumerate(before):
                 episode = Episode(
@@ -373,16 +413,12 @@ def plan_batch(
     # ---------------------------------------------------------
     ordered = list(items)
 
-    assignments: list[Episode] = []
+    assignments = []
 
     cursor = current
 
     for index, item in enumerate(ordered):
-        episode = (
-            cursor
-            if index == 0
-            else increment(cursor)
-        )
+        episode = cursor if index == 0 else increment(cursor)
 
         item.assigned = episode
 
@@ -435,3 +471,12 @@ def next_caption_from_successes(
         current_caption,
         next_episode,
     )
+
+
+def cache_info():
+    """Expose the detection cache stats (handy when profiling)."""
+    return _best_marker_pair_cached.cache_info()
+
+
+def clear_cache() -> None:
+    _best_marker_pair_cached.cache_clear()

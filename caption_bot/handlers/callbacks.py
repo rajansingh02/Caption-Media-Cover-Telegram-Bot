@@ -1,8 +1,23 @@
-"""Callback handlers for preview, batch review, processing and season controls."""
+"""Callback handlers for preview, batch review, processing and season controls.
+
+Performance notes
+-----------------
+
+* Source/acknowledgement messages are deleted in grouped calls (up to 100
+  message IDs per request, per chat) instead of one API round trip per
+  message. A finished 20-file batch drops from 20+ delete calls to 1, and
+  per-message accuracy is preserved by falling back to single deletes only
+  if a grouped call fails.
+* Finished episodes are written to the archive in one SQLite transaction
+  after the send pass instead of one commit per file.
+* The confirmed batch is planned once. `confirm` used to run `plan_batch`
+  and then `_process_batch` ran it again over the same items.
+* Cover sends go through the pooled keep-alive Bot API connection, so a
+  batch of videos performs one TLS handshake rather than one per video.
+"""
 
 from __future__ import annotations
 
-import asyncio
 from typing import Optional
 
 from pyrogram import Client
@@ -13,7 +28,8 @@ from pyrogram.types import (
 )
 
 from .. import archive
-from ..cover import CoverSendError, send_video_with_cover
+from ..cover import CoverSendError, send_video_with_cover_async
+from ..log import get as get_logger
 from ..preview import (
     batch_keyboard,
     build_preview,
@@ -28,6 +44,69 @@ from ..sequence import (
 )
 from ..state import get_state
 from . import transfer
+
+logger = get_logger(__name__)
+
+
+# Telegram accepts at most 100 message IDs per delete request.
+_DELETE_CHUNK = 100
+
+# Built once instead of on every rejection.
+_DELETE_SOURCES_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton(
+                "🗑️ Yes, delete",
+                callback_data="seq_batch_no_delete_yes",
+            ),
+            InlineKeyboardButton(
+                "Keep them",
+                callback_data="seq_batch_no_delete_no",
+            ),
+        ]
+    ]
+)
+
+_REVIEW_CALLBACKS = frozenset(
+    {
+        # Actual buttons sent by media.py / commands.py.
+        "seq_batch_yes",
+        "seq_batch_no",
+        # Follow-up "delete these source messages?" confirmation
+        # shown after "seq_batch_no".
+        "seq_batch_no_delete_yes",
+        "seq_batch_no_delete_no",
+        # Legacy / alternate aliases kept for compatibility.
+        "review_yes",
+        "review_no",
+        "yes",
+        "no",
+        "review_confirm",
+        "review_cancel",
+    }
+)
+
+_FINISHED_CALLBACKS = frozenset(
+    {
+        "nextseason",
+        "next_season",
+        "finished_nextseason",
+    }
+)
+
+_COVER_BATCH_CALLBACKS = frozenset({"cover_confirm", "cover_cancel"})
+
+_ACCEPT_CALLBACKS = frozenset(
+    {"seq_batch_yes", "review_yes", "yes", "review_confirm"}
+)
+
+_REJECT_CALLBACKS = frozenset(
+    {"seq_batch_no", "review_no", "no", "review_cancel"}
+)
+
+_DELETE_DECISION_CALLBACKS = frozenset(
+    {"seq_batch_no_delete_yes", "seq_batch_no_delete_no"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +143,7 @@ async def _edit(
         )
         return True
     except Exception as error:
-        print(
-            f"Callback message edit failed: {error}"
-        )
+        logger.warning("Callback message edit failed: %s", error)
         return False
 
 
@@ -88,6 +165,66 @@ async def _delete_message(
         pass
 
 
+async def _delete_ids(
+    client: Client,
+    chat_id: int,
+    message_ids: list[int],
+) -> tuple[int, int]:
+    """Delete message IDs in one chat using as few API calls as possible.
+
+    Returns (deleted_count, failed_count). If a grouped call fails the
+    chunk is retried one message at a time so the reported counts stay
+    exact.
+    """
+    deleted = 0
+    failed = 0
+
+    for start in range(0, len(message_ids), _DELETE_CHUNK):
+        chunk = message_ids[start : start + _DELETE_CHUNK]
+
+        try:
+            await client.delete_messages(chat_id, chunk)
+            deleted += len(chunk)
+            continue
+
+        except Exception as error:
+            logger.warning(
+                "Grouped delete failed in %s (%s message(s)): %s",
+                chat_id,
+                len(chunk),
+                error,
+            )
+
+        for message_id in chunk:
+            try:
+                await client.delete_messages(chat_id, message_id)
+                deleted += 1
+            except Exception as error:
+                failed += 1
+                logger.warning(
+                    "Could not delete message %s in %s: %s",
+                    message_id,
+                    chat_id,
+                    error,
+                )
+
+    return deleted, failed
+
+
+def _group_by_chat(items) -> dict[int, list[int]]:
+    by_chat: dict[int, list[int]] = {}
+
+    for item in items:
+        bucket = by_chat.get(item.chat_id)
+
+        if bucket is None:
+            by_chat[item.chat_id] = [item.message_id]
+        else:
+            bucket.append(item.message_id)
+
+    return by_chat
+
+
 async def _delete_items_messages(
     client: Client,
     items,
@@ -98,29 +235,18 @@ async def _delete_items_messages(
 
     Returns (deleted_count, failed_count).
     """
-    by_chat: dict[int, list[int]] = {}
-
-    for item in items:
-        by_chat.setdefault(
-            item.chat_id, []
-        ).append(item.message_id)
-
     deleted = 0
     failed = 0
 
-    for chat_id, message_ids in by_chat.items():
-        try:
-            await client.delete_messages(
-                chat_id,
-                message_ids,
-            )
-            deleted += len(message_ids)
-        except Exception as error:
-            print(
-                f"Could not delete rejected batch "
-                f"messages in {chat_id}: {error}"
-            )
-            failed += len(message_ids)
+    for chat_id, message_ids in _group_by_chat(items).items():
+        chunk_deleted, chunk_failed = await _delete_ids(
+            client,
+            chat_id,
+            message_ids,
+        )
+
+        deleted += chunk_deleted
+        failed += chunk_failed
 
     return deleted, failed
 
@@ -155,23 +281,15 @@ async def _delete_ack_messages(
     if chat_id is None:
         return
 
-    message_ids = list(
-        dict.fromkeys(
-            state.batch_ack_message_ids
-        )
-    )
-
-    if not message_ids:
+    if not state.batch_ack_message_ids:
         return
 
-    for message_id in message_ids:
-        await _delete_message(
-            client,
-            chat_id,
-            message_id,
-        )
+    # dict.fromkeys keeps order while removing duplicates.
+    message_ids = list(dict.fromkeys(state.batch_ack_message_ids))
 
     state.batch_ack_message_ids.clear()
+
+    await _delete_ids(client, chat_id, message_ids)
 
 
 def _callback_message_id(
@@ -196,40 +314,15 @@ def _state_user_id(
     return query.from_user.id
 
 
-def _is_review_callback(
-    data: str,
-) -> bool:
-    return data in {
-        # Actual buttons sent by media.py / commands.py.
-        "seq_batch_yes",
-        "seq_batch_no",
-        # Follow-up "delete these source messages?" confirmation
-        # shown after "seq_batch_no".
-        "seq_batch_no_delete_yes",
-        "seq_batch_no_delete_no",
-        # Legacy / alternate aliases kept for compatibility.
-        "review_yes",
-        "review_no",
-        "yes",
-        "no",
-        "review_confirm",
-        "review_cancel",
-    }
+def _is_review_callback(data: str) -> bool:
+    return data in _REVIEW_CALLBACKS
 
 
-def _is_finished_callback(
-    data: str,
-) -> bool:
-    return data in {
-        "nextseason",
-        "next_season",
-        "finished_nextseason",
-    }
+def _is_finished_callback(data: str) -> bool:
+    return data in _FINISHED_CALLBACKS
 
 
-def _is_preview_callback(
-    data: str,
-) -> bool:
+def _is_preview_callback(data: str) -> bool:
     return (
         data == "confirm"
         or data == "cancel"
@@ -238,18 +331,11 @@ def _is_preview_callback(
     )
 
 
-def _is_cover_batch_callback(
-    data: str,
-) -> bool:
-    return data in {
-        "cover_confirm",
-        "cover_cancel",
-    }
+def _is_cover_batch_callback(data: str) -> bool:
+    return data in _COVER_BATCH_CALLBACKS
 
 
-def _preview_result(
-    state,
-):
+def _preview_result(state):
     """
     Build the actual preview using the project's real preview API.
 
@@ -291,9 +377,7 @@ async def _refresh_preview(
 
         await query.message.edit_text(
             text,
-            reply_markup=batch_keyboard(
-                len(state.batch)
-            ),
+            reply_markup=batch_keyboard(len(state.batch)),
         )
 
         state.preview_message_id = query.message.id
@@ -301,9 +385,7 @@ async def _refresh_preview(
         return True
 
     except Exception as error:
-        print(
-            f"Could not refresh preview: {error}"
-        )
+        logger.warning("Could not refresh preview: %s", error)
         return False
 
 
@@ -337,8 +419,7 @@ def _validate_stateful_callback(
     if _is_review_callback(data):
         return (
             state.pending_review_message_id is not None
-            and message_id
-            == state.pending_review_message_id
+            and message_id == state.pending_review_message_id
         )
 
     # ---------------------------------------------------------------
@@ -348,8 +429,7 @@ def _validate_stateful_callback(
     if _is_preview_callback(data):
         return (
             state.preview_message_id is not None
-            and message_id
-            == state.preview_message_id
+            and message_id == state.preview_message_id
         )
 
     # ---------------------------------------------------------------
@@ -359,8 +439,7 @@ def _validate_stateful_callback(
     if _is_cover_batch_callback(data):
         return (
             state.cover_preview_message_id is not None
-            and message_id
-            == state.cover_preview_message_id
+            and message_id == state.cover_preview_message_id
         )
 
     # ---------------------------------------------------------------
@@ -381,10 +460,34 @@ def _validate_stateful_callback(
 # ---------------------------------------------------------------------------
 
 
+def _archive_row(
+    owner_id: int,
+    item,
+    episode,
+    caption: str,
+    cover_file_id: Optional[str],
+) -> dict:
+    return {
+        "owner_id": owner_id,
+        "season": episode.season,
+        "episode": episode.episode,
+        "caption": caption,
+        "media_type": item.media_type,
+        "file_id": item.file_id,
+        "width": item.width,
+        "height": item.height,
+        "duration": item.duration,
+        "supports_streaming": item.supports_streaming,
+        "has_spoiler": item.has_spoiler,
+        "cover_file_id": cover_file_id,
+    }
+
+
 async def _process_batch(
     client: Client,
     query: CallbackQuery,
     state,
+    preplanned: Optional[tuple[list, list]] = None,
 ) -> None:
     """
     Process every valid item in the confirmed batch.
@@ -392,6 +495,9 @@ async def _process_batch(
     Source messages are NOT deleted during processing.
 
     They are deleted only after the complete processing pass finishes.
+
+    `preplanned` carries the (ordered_items, assignments) pair when the
+    caller already ran plan_batch, so the batch is never planned twice.
     """
 
     if state.processing:
@@ -429,24 +535,27 @@ async def _process_batch(
         # Final planning
         # ---------------------------------------------------------------
 
-        try:
-            ordered_items, assignments = plan_batch(
-                items,
-                starting_caption,
-            )
-        except Exception as error:
-            print(
-                f"Could not plan confirmed batch: {error}"
-            )
+        if preplanned is not None:
+            ordered_items, assignments = preplanned
+        else:
+            try:
+                ordered_items, assignments = plan_batch(
+                    items,
+                    starting_caption,
+                )
+            except Exception as error:
+                logger.error(
+                    "Could not plan confirmed batch: %s", error
+                )
 
-            state.processing = False
+                state.processing = False
 
-            await _answer(
-                query,
-                "Could not prepare this batch.",
-                show_alert=True,
-            )
-            return
+                await _answer(
+                    query,
+                    "Could not prepare this batch.",
+                    show_alert=True,
+                )
+                return
 
         if not ordered_items:
             state.processing = False
@@ -479,15 +588,16 @@ async def _process_batch(
         # Process every item.
         # ---------------------------------------------------------------
 
+        owner_id = query.from_user.id
+        cover_file_id = state.cover_file_id
+
         processed_items = []
         failed_items = []
         successful_eps = []
+        archive_rows = []
 
         for item in ordered_items:
-            episode = (
-                item.assigned
-                or item.detected
-            )
+            episode = item.assigned or item.detected
 
             if episode is None:
                 failed_items.append(
@@ -515,9 +625,10 @@ async def _process_batch(
                     )
                 )
 
-                print(
-                    f"Caption generation failed for "
-                    f"{item.display_name}: {error}"
+                logger.error(
+                    "Caption generation failed for %s: %s",
+                    item.display_name,
+                    error,
                 )
                 continue
 
@@ -525,35 +636,32 @@ async def _process_batch(
             # Send/copy media.
             # -----------------------------------------------------------
 
+            use_cover = bool(cover_file_id) and item.media_type == "video"
+
             try:
                 # -------------------------------------------------------
                 # Video cover
                 #
-                # send_video_with_cover() is a synchronous, keyword-only
-                # function (it talks to the Bot API directly via
-                # urllib), so it must not be awaited directly and must
-                # be called with the real chat/file fields pulled off
-                # the item.  Per the documented contract, a rejected
+                # The Bot API call runs on cover.py's dedicated worker
+                # thread over a pooled keep-alive connection, so the
+                # event loop is never blocked and no handshake is repeated
+                # per video.  Per the documented contract, a rejected
                 # cover operation counts this item as FAILED — it must
                 # NOT silently fall back to a cover-less copy, or the
                 # user would never learn the cover wasn't applied.
                 # -------------------------------------------------------
 
-                if (
-                    state.cover_file_id
-                    and item.media_type == "video"
-                ):
+                if use_cover:
                     if not item.file_id:
                         raise CoverSendError(
                             "Video is missing a file_id."
                         )
 
-                    await asyncio.to_thread(
-                        send_video_with_cover,
+                    await send_video_with_cover_async(
                         chat_id=item.chat_id,
                         video_file_id=item.file_id,
                         caption=caption,
-                        cover_file_id=state.cover_file_id,
+                        cover_file_id=cover_file_id,
                         width=item.width,
                         height=item.height,
                         duration=item.duration,
@@ -579,41 +687,21 @@ async def _process_batch(
                 # -------------------------------------------------------
                 # Archive for /transfer.
                 #
-                # This is the only place completed episodes get recorded.
-                # It must never fail the batch itself — /transfer simply
-                # won't see this episode if writing the archive fails.
+                # Rows are collected here and written in a single
+                # transaction once the send pass is over. It must never
+                # fail the batch itself — /transfer simply won't see these
+                # episodes if writing the archive fails.
                 # -------------------------------------------------------
 
-                try:
-                    cover_used = (
-                        state.cover_file_id
-                        if (
-                            state.cover_file_id
-                            and item.media_type == "video"
-                        )
-                        else None
+                archive_rows.append(
+                    _archive_row(
+                        owner_id,
+                        item,
+                        episode,
+                        caption,
+                        cover_file_id if use_cover else None,
                     )
-
-                    archive.record_episode(
-                        owner_id=query.from_user.id,
-                        season=episode.season,
-                        episode=episode.episode,
-                        caption=caption,
-                        media_type=item.media_type,
-                        file_id=item.file_id,
-                        width=item.width,
-                        height=item.height,
-                        duration=item.duration,
-                        supports_streaming=item.supports_streaming,
-                        has_spoiler=item.has_spoiler,
-                        cover_file_id=cover_used,
-                    )
-
-                except Exception as error:
-                    print(
-                        "Could not archive episode for /transfer: "
-                        f"{error}"
-                    )
+                )
 
             except Exception as error:
                 failed_items.append(
@@ -623,9 +711,23 @@ async def _process_batch(
                     )
                 )
 
-                print(
-                    f"Error processing "
-                    f"{item.display_name}: {error}"
+                logger.error(
+                    "Error processing %s: %s",
+                    item.display_name,
+                    error,
+                )
+
+        # ---------------------------------------------------------------
+        # One archive transaction for the whole batch.
+        # ---------------------------------------------------------------
+
+        if archive_rows:
+            try:
+                archive.record_episodes(archive_rows)
+            except Exception as error:
+                logger.error(
+                    "Could not archive episodes for /transfer: %s",
+                    error,
                 )
 
         # ---------------------------------------------------------------
@@ -637,25 +739,10 @@ async def _process_batch(
         # Failed source messages remain available.
         # ---------------------------------------------------------------
 
-        deleted = 0
-        delete_failed = 0
-
-        for item in processed_items:
-            try:
-                await client.delete_messages(
-                    chat_id=item.chat_id,
-                    message_ids=item.message_id,
-                )
-
-                deleted += 1
-
-            except Exception as error:
-                delete_failed += 1
-
-                print(
-                    f"Could not delete source "
-                    f"{item.display_name}: {error}"
-                )
+        deleted, delete_failed = await _delete_items_messages(
+            client,
+            processed_items,
+        )
 
         # ---------------------------------------------------------------
         # Advance caption from the highest ACTUALLY successful episode.
@@ -675,21 +762,19 @@ async def _process_batch(
 
         if successful_eps:
             try:
-                state.current_caption = (
-                    next_caption_from_successes(
-                        starting_caption,
-                        successful_eps,
-                        [
-                            item.assigned
-                            for item, _ in failed_items
-                            if item.assigned is not None
-                        ],
-                    )
+                state.current_caption = next_caption_from_successes(
+                    starting_caption,
+                    successful_eps,
+                    [
+                        item.assigned
+                        for item, _ in failed_items
+                        if item.assigned is not None
+                    ],
                 )
 
             except Exception as error:
-                print(
-                    f"Could not advance caption sequence: {error}"
+                logger.error(
+                    "Could not advance caption sequence: %s", error
                 )
 
                 state.current_caption = starting_caption
@@ -763,22 +848,14 @@ async def _process_batch(
         )
 
         if failed_items:
-            result_lines.extend(
-                [
-                    "",
-                    "❌ Failed files:",
-                ]
-            )
+            result_lines.append("")
+            result_lines.append("❌ Failed files:")
 
-            for item, error in failed_items[:20]:
-                result_lines.append(
-                    f"• {item.display_name}"
-                )
+            for item, _ in failed_items[:20]:
+                result_lines.append(f"• {item.display_name}")
 
-            if len(failed_items) > 20:
-                result_lines.append(
-                    f"• ...and {len(failed_items) - 20} more"
-                )
+            if failed > 20:
+                result_lines.append(f"• ...and {failed - 20} more")
 
         finished_text = "\n".join(result_lines)
 
@@ -788,20 +865,18 @@ async def _process_batch(
 
         try:
             await client.send_message(
-                chat_id=query.from_user.id,
+                chat_id=owner_id,
                 text=finished_text,
                 reply_markup=finished_keyboard(),
             )
 
         except Exception as error:
-            print(
-                f"Could not send final batch message: {error}"
+            logger.error(
+                "Could not send final batch message: %s", error
             )
 
     except Exception as error:
-        print(
-            f"Unexpected batch processing error: {error}"
-        )
+        logger.exception("Unexpected batch processing error: %s", error)
 
         state.processing = False
 
@@ -857,6 +932,8 @@ async def _process_cover_batch(
     processed_items = []
     failed_items = []
 
+    cover_file_id = state.cover_file_id
+
     try:
         for item in items:
             try:
@@ -866,12 +943,11 @@ async def _process_cover_batch(
                             "Video is missing a file_id."
                         )
 
-                    await asyncio.to_thread(
-                        send_video_with_cover,
+                    await send_video_with_cover_async(
                         chat_id=item.chat_id,
                         video_file_id=item.file_id,
                         caption=item.caption or "",
-                        cover_file_id=state.cover_file_id,
+                        cover_file_id=cover_file_id,
                         width=item.width,
                         height=item.height,
                         duration=item.duration,
@@ -890,38 +966,29 @@ async def _process_cover_batch(
 
             except Exception as error:
                 failed_items.append((item, str(error)))
-                print(
-                    f"Cover-only processing failed for "
-                    f"{item.display_name}: {error}"
+                logger.error(
+                    "Cover-only processing failed for %s: %s",
+                    item.display_name,
+                    error,
                 )
 
-        deleted = 0
-        delete_failed = 0
-
-        for item in processed_items:
-            try:
-                await client.delete_messages(
-                    chat_id=item.chat_id,
-                    message_ids=item.message_id,
-                )
-                deleted += 1
-            except Exception as error:
-                delete_failed += 1
-                print(
-                    f"Could not delete source "
-                    f"{item.display_name}: {error}"
-                )
+        deleted, delete_failed = await _delete_items_messages(
+            client,
+            processed_items,
+        )
 
         state.cover_batch.clear()
         state.cover_preview_message_id = None
         state.processing = False
+
+        failed = len(failed_items)
 
         result_lines = [
             "✅ Cover batch finished.",
             "",
             f"Total: {len(items)}",
             f"Processed: {len(processed_items)}",
-            f"Failed: {len(failed_items)}",
+            f"Failed: {failed}",
             f"Sources deleted: {deleted}",
         ]
 
@@ -931,13 +998,14 @@ async def _process_cover_batch(
             )
 
         if failed_items:
-            result_lines.extend(["", "❌ Failed files:"])
+            result_lines.append("")
+            result_lines.append("❌ Failed files:")
+
             for item, _ in failed_items[:20]:
                 result_lines.append(f"• {item.display_name}")
-            if len(failed_items) > 20:
-                result_lines.append(
-                    f"• ...and {len(failed_items) - 20} more"
-                )
+
+            if failed > 20:
+                result_lines.append(f"• ...and {failed - 20} more")
 
         try:
             await client.send_message(
@@ -945,13 +1013,13 @@ async def _process_cover_batch(
                 text="\n".join(result_lines),
             )
         except Exception as error:
-            print(
-                f"Could not send cover batch result: {error}"
+            logger.error(
+                "Could not send cover batch result: %s", error
             )
 
     except Exception as error:
-        print(
-            f"Unexpected cover batch processing error: {error}"
+        logger.exception(
+            "Unexpected cover batch processing error: %s", error
         )
         state.processing = False
         await _answer(
@@ -1004,6 +1072,8 @@ async def callback_handler(
                 show_alert=True,
             )
             return
+    elif isinstance(data_raw, str):
+        data = data_raw
     else:
         data = str(data_raw or "")
 
@@ -1056,10 +1126,7 @@ async def callback_handler(
             )
             return
 
-        if (
-            state.pending_items
-            or state.pending_valid_items
-        ):
+        if state.pending_items or state.pending_valid_items:
             await _answer(
                 query,
                 "You still have a batch waiting for review.",
@@ -1076,9 +1143,7 @@ async def callback_handler(
             return
 
         try:
-            current_episode = detect_episode(
-                state.current_caption
-            )
+            current_episode = detect_episode(state.current_caption)
 
             if current_episode is None:
                 await _answer(
@@ -1088,9 +1153,7 @@ async def callback_handler(
                 )
                 return
 
-            next_episode = next_season_episode(
-                current_episode
-            )
+            next_episode = next_season_episode(current_episode)
 
             state.current_caption = replace_episode(
                 state.current_caption,
@@ -1113,9 +1176,7 @@ async def callback_handler(
             )
 
         except Exception as error:
-            print(
-                f"Next season callback failed: {error}"
-            )
+            logger.error("Next season callback failed: %s", error)
 
             await _answer(
                 query,
@@ -1156,12 +1217,7 @@ async def callback_handler(
     # REVIEW YES
     # ===============================================================
 
-    if data in {
-        "seq_batch_yes",
-        "review_yes",
-        "yes",
-        "review_confirm",
-    }:
+    if data in _ACCEPT_CALLBACKS:
         # -----------------------------------------------------------
         # The pending valid list is the authoritative list for the
         # incoming burst.
@@ -1170,9 +1226,7 @@ async def callback_handler(
         # black-sheep files.
         # -----------------------------------------------------------
 
-        valid_items = list(
-            state.pending_valid_items
-        )
+        valid_items = list(state.pending_valid_items)
 
         # Compatibility fallback:
         # If an older command path already placed the valid files into
@@ -1200,18 +1254,11 @@ async def callback_handler(
         # -----------------------------------------------------------
 
         existing_ids = {
-            (
-                item.chat_id,
-                item.message_id,
-            )
-            for item in state.batch
+            (item.chat_id, item.message_id) for item in state.batch
         }
 
         for item in valid_items:
-            key = (
-                item.chat_id,
-                item.message_id,
-            )
+            key = (item.chat_id, item.message_id)
 
             if key not in existing_ids:
                 state.batch.append(item)
@@ -1240,14 +1287,10 @@ async def callback_handler(
         # -----------------------------------------------------------
 
         try:
-            captions, text = _preview_result(
-                state
-            )
+            captions, text = _preview_result(state)
 
         except Exception as error:
-            print(
-                f"Could not build accepted preview: {error}"
-            )
+            logger.error("Could not build accepted preview: %s", error)
 
             await _answer(
                 query,
@@ -1267,15 +1310,11 @@ async def callback_handler(
         try:
             await query.message.edit_text(
                 text,
-                reply_markup=batch_keyboard(
-                    len(state.batch)
-                ),
+                reply_markup=batch_keyboard(len(state.batch)),
             )
 
         except Exception as error:
-            print(
-                f"Could not update review message: {error}"
-            )
+            logger.warning("Could not update review message: %s", error)
 
         return
 
@@ -1283,21 +1322,12 @@ async def callback_handler(
     # REVIEW NO
     # ===============================================================
 
-    if data in {
-        "seq_batch_no",
-        "review_no",
-        "no",
-        "review_cancel",
-    }:
+    if data in _REJECT_CALLBACKS:
         # -----------------------------------------------------------
         # Cancel only the pending incoming burst.
         #
         # Do not destroy an already-confirmed active batch.
         # -----------------------------------------------------------
-
-        rejected = list(
-            state.pending_items
-        )
 
         # If the incoming burst was not separately populated, fall
         # back to cancelling the current batch as older behavior did.
@@ -1310,7 +1340,7 @@ async def callback_handler(
         if has_pending:
             # Do NOT clear pending_* yet — the follow-up delete
             # confirmation still needs the item list.
-            count = len(rejected)
+            count = len(state.pending_items)
 
             await _answer(
                 query,
@@ -1322,20 +1352,7 @@ async def callback_handler(
                 "❌ Incoming batch rejected.\n\n"
                 f"Delete these {count} source message(s) "
                 "from the chat?",
-                InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🗑️ Yes, delete",
-                                callback_data="seq_batch_no_delete_yes",
-                            ),
-                            InlineKeyboardButton(
-                                "Keep them",
-                                callback_data="seq_batch_no_delete_no",
-                            ),
-                        ]
-                    ]
-                ),
+                _DELETE_SOURCES_KEYBOARD,
             )
 
             return
@@ -1370,10 +1387,7 @@ async def callback_handler(
     # restore the previous "Batch finished" screen if one exists.
     # ===============================================================
 
-    if data in {
-        "seq_batch_no_delete_yes",
-        "seq_batch_no_delete_no",
-    }:
+    if data in _DELETE_DECISION_CALLBACKS:
         items = list(state.pending_items)
 
         state.pending_items.clear()
@@ -1384,17 +1398,17 @@ async def callback_handler(
         deleted = 0
         delete_failed = 0
 
-        if data == "seq_batch_no_delete_yes" and items:
-            deleted, delete_failed = (
-                await _delete_items_messages(
-                    client,
-                    items,
-                )
+        wants_delete = data == "seq_batch_no_delete_yes"
+
+        if wants_delete and items:
+            deleted, delete_failed = await _delete_items_messages(
+                client,
+                items,
             )
 
         text, keyboard = _restore_finished_screen(state)
 
-        if data == "seq_batch_no_delete_yes":
+        if wants_delete:
             toast = f"Deleted {deleted} source message(s)."
             if delete_failed:
                 toast += f" {delete_failed} could not be deleted."
@@ -1415,10 +1429,10 @@ async def callback_handler(
         return
 
     # ===============================================================
-    # MOVE UP
+    # MOVE UP / MOVE DOWN
     # ===============================================================
 
-    if data.startswith("up:"):
+    if data.startswith("up:") or data.startswith("down:"):
         if not state.batch:
             await _answer(
                 query,
@@ -1427,10 +1441,10 @@ async def callback_handler(
             )
             return
 
+        moving_up = data[0] == "u"
+
         try:
-            index = int(
-                data.split(":", 1)[1]
-            )
+            index = int(data.split(":", 1)[1])
         except (ValueError, IndexError):
             await _answer(
                 query,
@@ -1439,81 +1453,36 @@ async def callback_handler(
             )
             return
 
-        if (
-            index <= 0
-            or index >= len(state.batch)
-        ):
-            await _answer(
-                query,
-                "Cannot move that item up.",
-            )
-            return
+        size = len(state.batch)
 
-        state.batch[index - 1], state.batch[index] = (
-            state.batch[index],
-            state.batch[index - 1],
-        )
+        if moving_up:
+            if index <= 0 or index >= size:
+                await _answer(
+                    query,
+                    "Cannot move that item up.",
+                )
+                return
 
-        await _answer(
-            query,
-            "Moved up.",
-        )
+            first, second = index - 1, index
+            toast = "Moved up."
 
-        if not await _refresh_preview(
-            query,
-            state,
-        ):
-            await _answer(
-                query,
-                "Could not refresh the preview.",
-                show_alert=True,
-            )
+        else:
+            if index < 0 or index >= size - 1:
+                await _answer(
+                    query,
+                    "Cannot move that item down.",
+                )
+                return
 
-        return
+            first, second = index, index + 1
+            toast = "Moved down."
 
-    # ===============================================================
-    # MOVE DOWN
-    # ===============================================================
-
-    if data.startswith("down:"):
-        if not state.batch:
-            await _answer(
-                query,
-                "Batch is empty.",
-                show_alert=True,
-            )
-            return
-
-        try:
-            index = int(
-                data.split(":", 1)[1]
-            )
-        except (ValueError, IndexError):
-            await _answer(
-                query,
-                "Invalid position.",
-                show_alert=True,
-            )
-            return
-
-        if (
-            index < 0
-            or index >= len(state.batch) - 1
-        ):
-            await _answer(
-                query,
-                "Cannot move that item down.",
-            )
-            return
-
-        state.batch[index], state.batch[index + 1] = (
-            state.batch[index + 1],
-            state.batch[index],
-        )
+        batch = state.batch
+        batch[first], batch[second] = batch[second], batch[first]
 
         await _answer(
             query,
-            "Moved down.",
+            toast,
         )
 
         if not await _refresh_preview(
@@ -1587,6 +1556,9 @@ async def callback_handler(
 
         # -----------------------------------------------------------
         # Validate final assignments one more time.
+        #
+        # The result is handed to _process_batch so the plan is not
+        # computed twice for the same batch.
         # -----------------------------------------------------------
 
         try:
@@ -1596,9 +1568,7 @@ async def callback_handler(
             )
 
         except Exception as error:
-            print(
-                f"Final batch planning failed: {error}"
-            )
+            logger.error("Final batch planning failed: %s", error)
 
             await _answer(
                 query,
@@ -1625,6 +1595,7 @@ async def callback_handler(
             client,
             query,
             state,
+            preplanned=(ordered_items, assignments),
         )
 
         return

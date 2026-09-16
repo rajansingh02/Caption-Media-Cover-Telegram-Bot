@@ -1,6 +1,5 @@
-from caption_bot.main import app
+from caption_bot.main import app, run
 
 
 if __name__ == "__main__":
-    print("Caption bot is running...")
-    app.run()
+    run()

@@ -1,18 +1,28 @@
+"""Incoming media: burst collection, classification and review screens.
+
+Performance notes
+-----------------
+
+* Membership tests used to be `if item in rejected` against a list of
+  BatchItems. Each test ran the dataclass `__eq__` over 14 fields for
+  every candidate, i.e. O(files × rejected × 14) per review screen. They
+  are now identity lookups in a set.
+* Classification walks the burst once instead of building three separate
+  filtered lists.
+* Review/acknowledgement text is appended to one list and joined once.
+* States created by a stray message from an unrelated user are released
+  again instead of being kept forever.
+"""
+
 import asyncio
-from collections import Counter
 
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from ..config import MAX_BATCH_SIZE
+from ..config import COLLECTION_DELAY, MAX_BATCH_SIZE
 from ..models import BatchItem, Episode
 from ..sequence import detect_episode
-from ..state import get_state
-
-
-# Telegram normally delivers a multi-file burst very quickly.
-# Wait for a short quiet period before analyzing the incoming files.
-COLLECTION_DELAY = 2.5
+from ..state import get_state, release_if_idle
 
 
 MEDIA_FILTER = filters.private & (
@@ -24,20 +34,57 @@ MEDIA_FILTER = filters.private & (
 )
 
 
+# Built once instead of per review screen.
+_REVIEW_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton(
+                "✅ Yes, continue",
+                callback_data="seq_batch_yes",
+            ),
+            InlineKeyboardButton(
+                "❌ No",
+                callback_data="seq_batch_no",
+            ),
+        ]
+    ]
+)
+
+_COVER_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton(
+                "✅ Confirm & apply cover",
+                callback_data="cover_confirm",
+            ),
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="cover_cancel",
+            ),
+        ]
+    ]
+)
+
+
+def review_keyboard() -> InlineKeyboardMarkup:
+    return _REVIEW_KEYBOARD
+
+
 def get_filename(message):
     """
     Return the actual Telegram media filename.
 
     Existing Telegram captions are intentionally ignored.
     """
-    for media in (
-        message.document,
-        message.video,
-        message.audio,
-        message.animation,
-    ):
-        if media:
-            return media.file_name
+    media = (
+        message.document
+        or message.video
+        or message.audio
+        or message.animation
+    )
+
+    if media is not None:
+        return media.file_name
 
     return None
 
@@ -85,21 +132,21 @@ def build_batch_item(message) -> BatchItem:
     supports_streaming = False
     has_spoiler = False
 
-    if message.video:
+    video = message.video
+
+    if video:
         media_type = "video"
-        file_id = message.video.file_id
+        file_id = video.file_id
 
-        width = message.video.width
-        height = message.video.height
-        duration = message.video.duration
+        width = video.width
+        height = video.height
+        duration = video.duration
 
-        supports_streaming = bool(
-            message.video.supports_streaming
-        )
+        supports_streaming = bool(video.supports_streaming)
 
         has_spoiler = bool(
             getattr(
-                message.video,
+                video,
                 "has_spoiler",
                 False,
             )
@@ -153,29 +200,25 @@ def _expected_episode(state) -> Episode | None:
     episode after files have already been added to the batch.
     """
 
-    current = detect_episode(
-        state.current_caption
-    )
+    current = detect_episode(state.current_caption)
 
     if current is None:
         return None
 
-    existing = []
+    # One pass, no intermediate list: track the highest episode already
+    # sitting in the confirmed batch.
+    highest: Episode | None = None
 
     for item in state.batch:
-        episode = (
-            item.assigned
-            if item.assigned is not None
-            else item.detected
-        )
+        episode = item.assigned or item.detected
 
-        if episode is not None:
-            existing.append(episode)
+        if episode is not None and (
+            highest is None or episode > highest
+        ):
+            highest = episode
 
-    if not existing:
+    if highest is None:
         return current
-
-    highest = max(existing)
 
     return Episode(
         highest.season,
@@ -200,23 +243,32 @@ def _dominant_season(
         3. lowest season number for deterministic behavior
     """
 
-    explicit = [
-        item.detected
-        for item in items
-        if item.detected is not None
-    ]
+    # counts: season -> number of explicit files
+    # uniques: season -> set of episode numbers
+    counts: dict[int, int] = {}
+    uniques: dict[int, set[int]] = {}
 
-    if not explicit:
+    for item in items:
+        detected = item.detected
+
+        if detected is None:
+            continue
+
+        season = detected.season
+
+        counts[season] = counts.get(season, 0) + 1
+
+        bucket = uniques.get(season)
+
+        if bucket is None:
+            uniques[season] = {detected.episode}
+        else:
+            bucket.add(detected.episode)
+
+    if not counts:
         return None
 
-    counts = Counter(
-        episode.season
-        for episode in explicit
-    )
-
-    highest_count = max(
-        counts.values()
-    )
+    highest_count = max(counts.values())
 
     candidates = [
         season
@@ -225,42 +277,31 @@ def _dominant_season(
     ]
 
     if len(candidates) > 1:
-        unique_counts = {
-            season: len(
-                {
-                    episode.episode
-                    for episode in explicit
-                    if episode.season == season
-                }
-            )
-            for season in candidates
-        }
-
         highest_unique = max(
-            unique_counts.values()
+            len(uniques[season]) for season in candidates
         )
 
         candidates = [
             season
             for season in candidates
-            if unique_counts[season] == highest_unique
+            if len(uniques[season]) == highest_unique
         ]
 
-    if (
-        len(candidates) > 1
-        and expected is not None
-    ):
-        candidates.sort(
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if expected is not None:
+        expected_season = expected.season
+
+        return min(
+            candidates,
             key=lambda season: (
-                abs(
-                    season
-                    - expected.season
-                ),
+                abs(season - expected_season),
                 season,
-            )
+            ),
         )
 
-    return candidates[0]
+    return min(candidates)
 
 
 def _analyse_incoming(
@@ -292,16 +333,17 @@ def _analyse_incoming(
 
     expected = _expected_episode(state)
 
-    explicit = [
-        item
-        for item in items
-        if item.detected is not None
-    ]
+    has_explicit = False
+
+    for item in items:
+        if item.detected is not None:
+            has_explicit = True
+            break
 
     # No explicit SxxExx anywhere.
     #
     # Keep the existing inference behavior.
-    if not explicit:
+    if not has_explicit:
         return (
             None,
             list(items),
@@ -319,6 +361,10 @@ def _analyse_incoming(
     rejected: list[BatchItem] = []
 
     seen_episodes: set[Episode] = set()
+
+    # Lowest explicit episode among the accepted files, tracked here so
+    # the check below does not need a second pass.
+    first_valid: Episode | None = None
 
     for item in items:
         detected = item.detected
@@ -345,14 +391,14 @@ def _analyse_incoming(
 
         seen_episodes.add(detected)
 
+        if first_valid is None or detected < first_valid:
+            first_valid = detected
+
         valid.append(item)
 
     reason = None
 
-    if (
-        expected is not None
-        and dominant is not None
-    ):
+    if expected is not None and dominant is not None:
         if dominant == expected.season:
             # Same season.
             #
@@ -367,22 +413,11 @@ def _analyse_incoming(
             # S03E04
             #
             # is valid. E03 is simply missing.
-            explicit_valid = [
-                item.detected
-                for item in valid
-                if item.detected is not None
-            ]
-
-            if explicit_valid:
-                first_episode = min(
-                    explicit_valid
-                )
-
-                if (
-                    first_episode.episode
-                    != expected.episode
-                ):
-                    reason = "wrong_batch"
+            if (
+                first_valid is not None
+                and first_valid.episode != expected.episode
+            ):
+                reason = "wrong_batch"
 
         elif dominant == expected.season + 1:
             # Next season.
@@ -394,9 +429,8 @@ def _analyse_incoming(
             reason = "wrong_batch"
 
     # Any black sheep makes this require confirmation.
-    if rejected:
-        if reason is None:
-            reason = "wrong_batch"
+    if rejected and reason is None:
+        reason = "wrong_batch"
 
     return (
         reason,
@@ -413,10 +447,7 @@ def _format_episode(
     if episode is None:
         return "unknown"
 
-    return (
-        f"S{episode.season:02d}"
-        f"E{episode.episode:02d}"
-    )
+    return f"S{episode.season:02d}E{episode.episode:02d}"
 
 
 def _short_name(
@@ -431,10 +462,7 @@ def _short_name(
     if len(name) <= maximum:
         return name
 
-    return (
-        name[: maximum - 3]
-        + "..."
-    )
+    return name[: maximum - 3] + "..."
 
 
 def _build_review_text(
@@ -446,168 +474,135 @@ def _build_review_text(
     expected,
     reason,
 ):
-    current = detect_episode(
-        state.current_caption
-    )
+    current = detect_episode(state.current_caption)
 
     if reason == "next_season":
         title = "⚠️ Next season detected"
     else:
-        title = (
-            "⚠️ Are you sure you sent "
-            "the correct batch?"
-        )
+        title = "⚠️ Are you sure you sent the correct batch?"
 
     lines = [
         title,
         "",
-        f"Current sequence: "
-        f"{_format_episode(current)}",
-        f"Next expected file: "
-        f"{_format_episode(expected)}",
+        f"Current sequence: {_format_episode(current)}",
+        f"Next expected file: {_format_episode(expected)}",
     ]
 
-    valid_explicit = [
-        item.detected
-        for item in valid
-        if item.detected is not None
-    ]
+    append = lines.append
 
-    if (
-        dominant is not None
-        and valid_explicit
-    ):
-        first = min(valid_explicit)
-        last = max(valid_explicit)
+    # Identity set: avoids running BatchItem.__eq__ over every field for
+    # every file in the burst.
+    rejected_ids = {id(item) for item in rejected}
 
+    first: Episode | None = None
+    last: Episode | None = None
+    episode_numbers: set[int] = set()
+
+    valid_count = len(valid)
+    valid_seasons: set[int] = set()
+    all_valid_explicit = True
+
+    # Single pass over the accepted files gathers everything the summary
+    # lines below need.
+    for item in valid:
+        detected = item.detected
+
+        if detected is None:
+            all_valid_explicit = False
+            continue
+
+        valid_seasons.add(detected.season)
+        episode_numbers.add(detected.episode)
+
+        if first is None or detected < first:
+            first = detected
+
+        if last is None or detected > last:
+            last = detected
+
+    if dominant is not None and first is not None:
         if first == last:
-            lines.append(
-                "Detected batch: "
-                f"{_format_episode(first)}"
-            )
+            append(f"Detected batch: {_format_episode(first)}")
         else:
-            lines.append(
+            append(
                 "Detected batch: "
-                f"{_format_episode(first)}"
-                " → "
-                f"{_format_episode(last)}"
+                f"{_format_episode(first)} → {_format_episode(last)}"
             )
 
-    lines.extend(
-        [
-            "",
-            f"Received files "
-            f"({len(items)}):",
-        ]
-    )
+    append("")
+    append(f"Received files ({len(items)}):")
 
     for item in items:
-        if item in rejected:
+        detected = item.detected
+
+        if id(item) in rejected_ids:
             marker = "🔴"
-        elif item.detected is not None:
+        elif detected is not None:
             marker = "🟢"
         else:
             marker = "🟡"
 
-        if item.detected is not None:
-            detected_text = (
-                f" — {_format_episode(item.detected)}"
-            )
+        if detected is not None:
+            detected_text = f" — {_format_episode(detected)}"
         else:
-            detected_text = (
-                " — SxxExx not detected"
-            )
+            detected_text = " — SxxExx not detected"
 
-        lines.append(
-            f"{marker} "
-            f"{_short_name(item.display_name)}"
-            f"{detected_text}"
-        )
+        append(f"{marker} {_short_name(item.display_name)}{detected_text}")
 
     if rejected:
-        lines.extend(
-            [
-                "",
-                (
-                    f"🔴 {len(rejected)} file(s) "
-                    "are black sheep and will NOT "
-                    "be added."
-                ),
-            ]
+        append("")
+        append(
+            f"🔴 {len(rejected)} file(s) are black sheep "
+            "and will NOT be added."
         )
 
     # Explicit valid files all belong to one season.
-    if valid and all(
-        item.detected is not None
-        for item in valid
-    ):
-        seasons = {
-            item.detected.season
-            for item in valid
-            if item.detected is not None
-        }
-
-        if len(seasons) == 1:
-            lines.append(
-                ""
-                f"🧠 All {len(valid)} valid "
-                f"files belong to "
-                f"S{dominant:02d}."
-            )
-
-    # Explain gaps without treating them as errors.
-    if valid_explicit:
-        episode_numbers = sorted(
-            {
-                episode.episode
-                for episode in valid_explicit
-            }
+    if valid_count and all_valid_explicit and len(valid_seasons) == 1:
+        append(
+            f"🧠 All {valid_count} valid files belong to S{dominant:02d}."
         )
 
-        if len(episode_numbers) >= 2:
-            missing = []
+    # Explain gaps without treating them as errors.
+    if len(episode_numbers) >= 2:
+        low = min(episode_numbers)
+        high = max(episode_numbers)
 
-            for number in range(
-                episode_numbers[0],
-                episode_numbers[-1] + 1,
-            ):
-                if number not in episode_numbers:
-                    missing.append(number)
-
-            if missing:
-                if len(missing) <= 8:
-                    missing_text = ", ".join(
-                        f"E{number:02d}"
-                        for number in missing
-                    )
-                else:
-                    missing_text = (
-                        f"{len(missing)} episodes"
-                    )
-
-                lines.extend(
-                    [
-                        "",
-                        (
-                            "ℹ️ Missing episode(s) in "
-                            "this batch: "
-                            f"{missing_text}"
-                        ),
-                        (
-                            "Missing episodes are not "
-                            "treated as errors."
-                        ),
-                    ]
-                )
-
-    lines.extend(
-        [
-            "",
-            "Continue with the detected batch?",
+        missing = [
+            number
+            for number in range(low, high + 1)
+            if number not in episode_numbers
         ]
-    )
+
+        if missing:
+            if len(missing) <= 8:
+                missing_text = ", ".join(
+                    f"E{number:02d}" for number in missing
+                )
+            else:
+                missing_text = f"{len(missing)} episodes"
+
+            append("")
+            append(
+                f"ℹ️ Missing episode(s) in this batch: {missing_text}"
+            )
+            append("Missing episodes are not treated as errors.")
+
+    append("")
+    append("Continue with the detected batch?")
 
     return "\n".join(lines)
+
+
+def build_ack_text(valid, maximum: int = 100) -> str:
+    """"Added to batch" acknowledgement, built with a single join."""
+    parts = [f"➕ Added {len(valid)} file(s) to batch.\n"]
+
+    for item in valid:
+        parts.append(f"• {_short_name(item.display_name, maximum)}")
+
+    parts.append("\nWhen finished, use /preview.")
+
+    return "\n".join(parts)
 
 
 async def _finalize_incoming(
@@ -620,19 +615,14 @@ async def _finalize_incoming(
     """
 
     try:
-        await asyncio.sleep(
-            COLLECTION_DELAY
-        )
+        await asyncio.sleep(COLLECTION_DELAY)
     except asyncio.CancelledError:
         return
 
     state = get_state(user_id)
 
     # A newer task has replaced this one.
-    if (
-        state.collection_task
-        is not asyncio.current_task()
-    ):
+    if state.collection_task is not asyncio.current_task():
         return
 
     state.collection_task = None
@@ -640,17 +630,12 @@ async def _finalize_incoming(
     if not state.incoming_batch:
         return
 
-    items = list(
-        state.incoming_batch
-    )
+    items = list(state.incoming_batch)
     state.incoming_batch.clear()
 
     # Never lose files if /preview or processing happened while
     # the collection timer was active.
-    if (
-        state.processing
-        or state.preview_message_id
-    ):
+    if state.processing or state.preview_message_id:
         state.incoming_batch.extend(items)
         return
 
@@ -667,22 +652,14 @@ async def _finalize_incoming(
 
     # Completely normal incoming batch.
     if reason is None:
-        if (
-            len(state.batch)
-            + len(valid)
-            > MAX_BATCH_SIZE
-        ):
-            state.incoming_batch.extend(
-                items
-            )
+        if len(state.batch) + len(valid) > MAX_BATCH_SIZE:
+            state.incoming_batch.extend(items)
 
             await client.send_message(
                 user_id,
                 (
-                    f"⚠️ Batch limit reached "
-                    f"({MAX_BATCH_SIZE}).\n\n"
-                    "Use /preview before adding "
-                    "more files."
+                    f"⚠️ Batch limit reached ({MAX_BATCH_SIZE}).\n\n"
+                    "Use /preview before adding more files."
                 ),
             )
 
@@ -692,20 +669,10 @@ async def _finalize_incoming(
 
         ack = await client.send_message(
             user_id,
-            (
-                f"➕ Added {len(valid)} "
-                "file(s) to batch.\n\n"
-                + "\n".join(
-                    f"• {_short_name(item.display_name, 100)}"
-                    for item in valid
-                )
-                + "\n\nWhen finished, use /preview."
-            ),
+            build_ack_text(valid),
         )
 
-        state.batch_ack_message_ids.append(
-            ack.id
-        )
+        state.batch_ack_message_ids.append(ack.id)
 
         return
 
@@ -715,24 +682,7 @@ async def _finalize_incoming(
 
     state.pending_items = list(items)
     state.pending_valid_items = list(valid)
-    state.pending_rejected_items = list(
-        rejected
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Yes, continue",
-                    callback_data="seq_batch_yes",
-                ),
-                InlineKeyboardButton(
-                    "❌ No",
-                    callback_data="seq_batch_no",
-                ),
-            ]
-        ]
-    )
+    state.pending_rejected_items = list(rejected)
 
     review = await client.send_message(
         user_id,
@@ -745,65 +695,42 @@ async def _finalize_incoming(
             expected=expected,
             reason=reason,
         ),
-        reply_markup=keyboard,
+        reply_markup=_REVIEW_KEYBOARD,
     )
 
-    state.pending_review_message_id = (
-        review.id
-    )
+    state.pending_review_message_id = review.id
 
 
 def _cover_only_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Confirm & apply cover",
-                    callback_data="cover_confirm",
-                ),
-                InlineKeyboardButton(
-                    "❌ Cancel",
-                    callback_data="cover_cancel",
-                ),
-            ]
-        ]
-    )
+    return _COVER_KEYBOARD
 
 
 def _build_cover_preview_text(
     state,
     items: list[BatchItem],
 ) -> str:
-    videos = sum(
-        1
-        for item in items
-        if item.media_type == "video"
-    )
+    videos = 0
+
+    for item in items:
+        if item.media_type == "video":
+            videos += 1
 
     lines = [
-        "🖼️ Cover-only mode "
-        "(no caption sequence active).",
+        "🖼️ Cover-only mode (no caption sequence active).",
         "",
         f"📦 Batch: {len(items)} file(s), "
-        f"{videos} video(s) will get the "
-        "saved cover.",
-        "Other files are passed through "
-        "unchanged.",
+        f"{videos} video(s) will get the saved cover.",
+        "Other files are passed through unchanged.",
         "",
     ]
 
-    for index, item in enumerate(items, 1):
-        lines.append(
-            f"{index}. "
-            f"{_short_name(item.display_name, 100)}"
-        )
+    append = lines.append
 
-    lines.extend(
-        [
-            "",
-            "Confirm to process?",
-        ]
-    )
+    for index, item in enumerate(items, 1):
+        append(f"{index}. {_short_name(item.display_name, 100)}")
+
+    append("")
+    append("Confirm to process?")
 
     return "\n".join(lines)
 
@@ -816,18 +743,13 @@ async def _finalize_cover_only(
     cover-only confirmation for the whole burst."""
 
     try:
-        await asyncio.sleep(
-            COLLECTION_DELAY
-        )
+        await asyncio.sleep(COLLECTION_DELAY)
     except asyncio.CancelledError:
         return
 
     state = get_state(user_id)
 
-    if (
-        state.cover_collection_task
-        is not asyncio.current_task()
-    ):
+    if state.cover_collection_task is not asyncio.current_task():
         return
 
     state.cover_collection_task = None
@@ -848,7 +770,7 @@ async def _finalize_cover_only(
 
     # Sort into a sensible sequence when every file carries a
     # detectable SxxExx marker; otherwise keep arrival order.
-    if items and all(item.detected for item in items):
+    if all(item.detected is not None for item in items):
         items.sort(
             key=lambda item: (
                 item.detected.season,
@@ -864,7 +786,7 @@ async def _finalize_cover_only(
             state,
             items,
         ),
-        reply_markup=_cover_only_keyboard(),
+        reply_markup=_COVER_KEYBOARD,
     )
 
     state.cover_preview_message_id = review.id
@@ -880,45 +802,34 @@ async def _receive_cover_only(
 
     if state.processing:
         await message.reply_text(
-            "⏳ The current batch is still "
-            "processing."
+            "⏳ The current batch is still processing."
         )
         return
 
     if state.cover_preview_message_id:
         await message.reply_text(
-            "⚠️ A cover batch is waiting for "
-            "confirmation.\n\n"
+            "⚠️ A cover batch is waiting for confirmation.\n\n"
             "Confirm or cancel it first."
         )
         return
 
-    if (
-        len(state.cover_batch)
-        >= MAX_BATCH_SIZE
-    ):
+    if len(state.cover_batch) >= MAX_BATCH_SIZE:
         await message.reply_text(
-            f"⚠️ Batch limit reached "
-            f"({MAX_BATCH_SIZE})."
+            f"⚠️ Batch limit reached ({MAX_BATCH_SIZE})."
         )
         return
 
-    state.cover_batch.append(
-        build_batch_item(message)
-    )
+    state.cover_batch.append(build_batch_item(message))
 
-    if (
-        state.cover_collection_task
-        and not state.cover_collection_task.done()
-    ):
-        state.cover_collection_task.cancel()
+    task = state.cover_collection_task
 
-    state.cover_collection_task = (
-        asyncio.create_task(
-            _finalize_cover_only(
-                client,
-                user_id,
-            )
+    if task is not None and not task.done():
+        task.cancel()
+
+    state.cover_collection_task = asyncio.create_task(
+        _finalize_cover_only(
+            client,
+            user_id,
         )
     )
 
@@ -939,25 +850,19 @@ def register(app):
         if state.awaiting_cover:
             if not message.photo:
                 await message.reply_text(
-                    "❌ Please send a photo for "
-                    "the cover, or use /cover off."
+                    "❌ Please send a photo for the cover, "
+                    "or use /cover off."
                 )
                 return
 
-            state.cover_file_id = (
-                message.photo.file_id
-            )
-
-            state.cover_message_id = (
-                message.id
-            )
-
+            state.cover_file_id = message.photo.file_id
+            state.cover_message_id = message.id
             state.awaiting_cover = False
 
             await message.reply_text(
                 "✅ Video cover saved.\n\n"
-                "It will be applied automatically "
-                "to video files in future batches."
+                "It will be applied automatically to video files "
+                "in future batches."
             )
 
             return
@@ -978,6 +883,11 @@ def register(app):
                     state,
                     user_id,
                 )
+            else:
+                # Nothing is configured for this user: do not keep an
+                # empty state object around.
+                release_if_idle(user_id)
+
             return
 
         # -----------------------------------------------------
@@ -986,8 +896,7 @@ def register(app):
 
         if state.processing:
             await message.reply_text(
-                "⏳ The current batch is still "
-                "processing."
+                "⏳ The current batch is still processing."
             )
             return
 
@@ -997,8 +906,7 @@ def register(app):
 
         if state.preview_message_id:
             await message.reply_text(
-                "⚠️ A batch is waiting for "
-                "confirmation.\n\n"
+                "⚠️ A batch is waiting for confirmation.\n\n"
                 "Confirm or cancel it first."
             )
             return
@@ -1014,10 +922,8 @@ def register(app):
 
         if state.pending_items:
             await message.reply_text(
-                "⚠️ A batch confirmation is "
-                "waiting.\n\n"
-                "Please answer it before "
-                "sending another batch."
+                "⚠️ A batch confirmation is waiting.\n\n"
+                "Please answer it before sending another batch."
             )
             return
 
@@ -1025,40 +931,27 @@ def register(app):
         # Add this file to the temporary incoming burst.
         # -----------------------------------------------------
 
-        active_count = (
-            len(state.batch)
-            + len(state.incoming_batch)
-        )
+        active_count = len(state.batch) + len(state.incoming_batch)
 
         if active_count >= MAX_BATCH_SIZE:
             await message.reply_text(
-                f"⚠️ Batch limit reached "
-                f"({MAX_BATCH_SIZE}).\n\n"
+                f"⚠️ Batch limit reached ({MAX_BATCH_SIZE}).\n\n"
                 "Use /preview."
             )
             return
 
-        item = build_batch_item(
-            message
-        )
-
-        state.incoming_batch.append(
-            item
-        )
+        state.incoming_batch.append(build_batch_item(message))
 
         # Cancel the previous quiet-period timer.
-        if (
-            state.collection_task
-            and not state.collection_task.done()
-        ):
-            state.collection_task.cancel()
+        task = state.collection_task
+
+        if task is not None and not task.done():
+            task.cancel()
 
         # Start a fresh quiet-period timer.
-        state.collection_task = (
-            asyncio.create_task(
-                _finalize_incoming(
-                    client,
-                    user_id,
-                )
+        state.collection_task = asyncio.create_task(
+            _finalize_incoming(
+                client,
+                user_id,
             )
         )

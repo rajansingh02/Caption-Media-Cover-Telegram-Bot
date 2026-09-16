@@ -1,7 +1,31 @@
+"""Preview text and inline keyboards.
+
+Performance notes
+-----------------
+
+* `replace_episode` was imported inside the caption loop; it is now a
+  normal module-level import.
+* The preview text is assembled from a list of chunks and joined once.
+* `batch_keyboard()` is memoised for the last few batch sizes. Every
+  ⬆️/⬇️ press rebuilds the preview with the *same* number of files, so
+  the two-buttons-per-row markup (up to ~200 objects for a large batch)
+  is now built once per batch size instead of once per press.
+"""
+
+from functools import lru_cache
+
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import MAX_CAPTION_LENGTH
-from .sequence import plan_batch
+from .sequence import plan_batch, replace_episode
+
+
+_CONFIRM_ROW = [
+    InlineKeyboardButton("✅ Confirm & process", callback_data="confirm")
+]
+_CANCEL_ROW = [
+    InlineKeyboardButton("❌ Cancel batch", callback_data="cancel")
+]
 
 
 def build_preview(state):
@@ -12,51 +36,83 @@ def build_preview(state):
 
     # Keep the same state object but make the final order explicit before confirmation.
     state.batch[:] = ordered
+
     captions = []
+
     for episode in episodes:
-        from .sequence import replace_episode
         caption = replace_episode(state.current_caption, episode)
+
         if len(caption) > MAX_CAPTION_LENGTH:
             return None, "Generated caption exceeds Telegram's 1024-character limit."
+
         captions.append(caption)
 
     lines = [
         f"📦 Batch: {len(state.batch)} file(s)",
         "🧠 Smart season/episode detection enabled.",
         "📌 Filename SxxExx markers override the active sequence.",
+        (
+            "🖼️ Video cover: ON (applies to videos only)."
+            if state.cover_file_id
+            else "🖼️ Video cover: OFF."
+        ),
+        "",
     ]
-    if state.cover_file_id:
-        lines.append("🖼️ Video cover: ON (applies to videos only).")
-    else:
-        lines.append("🖼️ Video cover: OFF.")
-    lines.append("")
-    for index, (item, caption, episode) in enumerate(zip(state.batch, captions, episodes), 1):
+
+    append = lines.append
+
+    for index, (item, caption, episode) in enumerate(
+        zip(state.batch, captions, episodes),
+        1,
+    ):
         source = "detected" if item.detected else "inferred"
-        lines.append(
+        append(
             f"{index}. {item.display_name}\n"
             f"   → {caption}\n"
             f"   ({source}: S{episode.season:02d}E{episode.episode:02d})"
         )
-    lines.append("\nReview the order before confirming.")
+
+    append("\nReview the order before confirming.")
+
     return captions, "\n".join(lines)
 
 
+@lru_cache(maxsize=4)
 def batch_keyboard(count: int) -> InlineKeyboardMarkup:
     keyboard = []
+
     for index in range(count):
         row = []
+
         if index > 0:
-            row.append(InlineKeyboardButton(f"⬆️ {index + 1}", callback_data=f"up:{index}"))
+            row.append(
+                InlineKeyboardButton(
+                    f"⬆️ {index + 1}",
+                    callback_data=f"up:{index}",
+                )
+            )
+
         if index < count - 1:
-            row.append(InlineKeyboardButton(f"⬇️ {index + 1}", callback_data=f"down:{index}"))
+            row.append(
+                InlineKeyboardButton(
+                    f"⬇️ {index + 1}",
+                    callback_data=f"down:{index}",
+                )
+            )
+
         if row:
             keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("✅ Confirm & process", callback_data="confirm")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel batch", callback_data="cancel")])
+
+    keyboard.append(_CONFIRM_ROW)
+    keyboard.append(_CANCEL_ROW)
+
     return InlineKeyboardMarkup(keyboard)
 
 
+_FINISHED_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🔄 Start Next Season", callback_data="nextseason")]]
+)
+
+
 def finished_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Start Next Season", callback_data="nextseason")]
-    ])
+    return _FINISHED_KEYBOARD
